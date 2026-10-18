@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/joho/godotenv"
 	"google.golang.org/genai"
@@ -72,6 +73,7 @@ func listModels(ctx context.Context, client *genai.Client) {
 }
 
 func main() {
+
 	ctx := context.Background()
 
 	_ = godotenv.Load()
@@ -98,6 +100,7 @@ func main() {
 
 	app := fiber.New()
 	app.Use(logger.New())
+	app.Use(cors.New())
 
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("ИИ-Тамада бэкенд на Go Fiber запущен! 🎤")
