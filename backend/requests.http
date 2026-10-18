@@ -1,0 +1,6 @@
+POST http://localhost:8080/api/tamada
+Content-Type: application/json
+
+{
+  "message": "Сегодня у нас свадьба помоги нам браток"
+}
