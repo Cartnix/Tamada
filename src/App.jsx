@@ -3,6 +3,7 @@ import { Canvas } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import { Robot } from './Robot'
 import Audio from './features/Audio'
+import TamadaVoice from './tamadaVoice'
 
 // пока фейковая громкость, потом заменим на AnalyserNode
 const fakeVolume = () => (Math.sin(performance.now() / 110) + 1) / 2
@@ -35,7 +36,7 @@ export default function App() {
         </button>
       </div> */}
 
-      <Audio/>
+      <TamadaVoice/>
     </>
   )
 }

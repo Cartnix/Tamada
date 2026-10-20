@@ -1,13 +1,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
-	"fmt"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
 	"log"
 	"os"
+	"strings"
+	"sync"
+	"time"
 
+	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -15,10 +19,17 @@ import (
 	"google.golang.org/genai"
 )
 
-const systemInstruction = `Ты — веселый, харизматичный и немного дерзкий ИИ-тамада на казахско-русской свадьбе по имени Тамада-3000.
-Твоя задача — развлекать гостя, постоянно задавать смешные вопросы, на ходу придумывать тосты, шутить про родственников, жениха и невесту.
-Говори на смеси русского и казахского (с колоритом: 'базар жок', 'туган жер', 'уважаемый', 'красавчик'). Твой тон — энергичный и громкий.
-Отвечай коротко: не больше 5-6 предложений, без markdown, без эмодзи и списков — текст будет озвучен голосом.`
+const systemInstruction = `Ты веселый, харизматичный и немного дерзкий ИИ-тамада на казахско-русской свадьбе по имени Тамада-3000.
+Твоя задача развлекать гостя, задавать смешные вопросы, на ходу придумывать тосты, шутить про родственников, жениха и невесту.
+Говори на смеси русского и казахского (с колоритом: "базар жок", "туган жер", "уважаемый", "красавчик"). Тон энергичный и громкий.
+Отвечай коротко, не больше 5-6 предложений. Это живой разговор по голосу, поэтому без списков и markdown.`
+
+const (
+	maxReconnects = 4
+	maxFrameBytes = 64 * 1024 // защита от гигантских сообщений от клиента
+)
+
+var errNoSession = errors.New("live-сессия ещё не готова")
 
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -27,149 +38,277 @@ func getEnv(key, def string) string {
 	return def
 }
 
-func pcmToWav(pcm []byte, sampleRate, channels, bits int) []byte {
-	var buf bytes.Buffer
-	byteRate := sampleRate * channels * bits / 8
-	blockAlign := channels * bits / 8
+// bridge связывает одно WS-соединение клиента с одной (переподключаемой) Live-сессией Gemini.
+type bridge struct {
+	client *genai.Client
+	model  string
+	conn   *websocket.Conn
 
-	buf.WriteString("RIFF")
-	binary.Write(&buf, binary.LittleEndian, uint32(36+len(pcm)))
-	buf.WriteString("WAVEfmt ")
-	binary.Write(&buf, binary.LittleEndian, uint32(16))
-	binary.Write(&buf, binary.LittleEndian, uint16(1)) // PCM
-	binary.Write(&buf, binary.LittleEndian, uint16(channels))
-	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))
-	binary.Write(&buf, binary.LittleEndian, uint32(byteRate))
-	binary.Write(&buf, binary.LittleEndian, uint16(blockAlign))
-	binary.Write(&buf, binary.LittleEndian, uint16(bits))
-	buf.WriteString("data")
-	binary.Write(&buf, binary.LittleEndian, uint32(len(pcm)))
-	buf.Write(pcm)
-	return buf.Bytes()
+	wmu sync.Mutex // запись в WS должна быть последовательной
+
+	smu    sync.RWMutex
+	sess   *genai.Session
+	handle string // токен возобновления сессии
 }
 
-func listModels(ctx context.Context, client *genai.Client) {
-	fmt.Println("Ищем доступные модели...")
-	page, err := client.Models.List(ctx, nil)
-	if err != nil {
-		log.Printf("Не удалось получить список моделей: %v\n", err)
-		return
+func (b *bridge) writeJSON(v any) error {
+	b.wmu.Lock()
+	defer b.wmu.Unlock()
+	return b.conn.WriteJSON(v)
+}
+
+func (b *bridge) writeBinary(data []byte) error {
+	b.wmu.Lock()
+	defer b.wmu.Unlock()
+	return b.conn.WriteMessage(websocket.BinaryMessage, data)
+}
+
+func (b *bridge) liveConfig() *genai.LiveConnectConfig {
+	b.smu.RLock()
+	handle := b.handle
+	b.smu.RUnlock()
+
+	return &genai.LiveConnectConfig{
+		ResponseModalities: []genai.Modality{genai.ModalityAudio},
+		SystemInstruction:  genai.NewContentFromText(systemInstruction, "system"),
+		SpeechConfig: &genai.SpeechConfig{
+			VoiceConfig: &genai.VoiceConfig{
+				PrebuiltVoiceConfig: &genai.PrebuiltVoiceConfig{VoiceName: "Fenrir"},
+			},
+		},
+		InputAudioTranscription:  &genai.AudioTranscriptionConfig{},
+		OutputAudioTranscription: &genai.AudioTranscriptionConfig{},
+		// Чтобы сессия не умирала по лимиту контекста/времени.
+		ContextWindowCompression: &genai.ContextWindowCompressionConfig{
+			SlidingWindow: &genai.SlidingWindow{},
+		},
+		// Пустой handle = новая сессия, непустой = продолжение прежней.
+		SessionResumption: &genai.SessionResumptionConfig{Handle: handle},
 	}
+}
+
+func (b *bridge) open(ctx context.Context) error {
+	s, err := b.client.Live.Connect(ctx, b.model, b.liveConfig())
+	if err != nil {
+		return err
+	}
+	b.smu.Lock()
+	old := b.sess
+	b.sess = s
+	b.smu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	return nil
+}
+
+func (b *bridge) session() *genai.Session {
+	b.smu.RLock()
+	defer b.smu.RUnlock()
+	return b.sess
+}
+
+func (b *bridge) close() {
+	b.smu.Lock()
+	s := b.sess
+	b.sess = nil
+	b.smu.Unlock()
+	if s != nil {
+		_ = s.Close()
+	}
+}
+
+func (b *bridge) send(in genai.LiveRealtimeInput) error {
+	s := b.session()
+	if s == nil {
+		return errNoSession
+	}
+	return s.SendRealtimeInput(in)
+}
+
+// reconnect пытается восстановить сессию с экспоненциальной паузой.
+func (b *bridge) reconnect(ctx context.Context) bool {
+	for attempt := 1; attempt <= maxReconnects; attempt++ {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(time.Duration(attempt) * 600 * time.Millisecond):
+		}
+		if err := b.open(ctx); err != nil {
+			log.Printf("Live: переподключение %d/%d не удалось: %v", attempt, maxReconnects, err)
+			continue
+		}
+		log.Println("Live: сессия восстановлена")
+		return true
+	}
+	return false
+}
+
+// receiveLoop читает ответы Gemini и пересылает клиенту. Возвращается, когда клиент ушёл
+// или восстановить сессию не получилось.
+func (b *bridge) receiveLoop(ctx context.Context) {
 	for {
-		for _, model := range page.Items {
-			if model != nil {
-				fmt.Printf("Доступная модель: %s\n", model.Name)
+		s := b.session()
+		if s == nil {
+			return
+		}
+		msg, err := s.Receive()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("Live: приём прервался: %v", err)
+			_ = b.writeJSON(fiber.Map{"type": "status", "state": "reconnecting"})
+			if !b.reconnect(ctx) {
+				_ = b.writeJSON(fiber.Map{"type": "error", "message": "Связь с Тамадой потеряна"})
+				return
+			}
+			_ = b.writeJSON(fiber.Map{"type": "status", "state": "live"})
+			continue
+		}
+
+		if u := msg.SessionResumptionUpdate; u != nil && u.Resumable && u.NewHandle != "" {
+			b.smu.Lock()
+			b.handle = u.NewHandle
+			b.smu.Unlock()
+		}
+		if msg.GoAway != nil {
+			log.Println("Live: сервер скоро закроет соединение (GoAway), переподключимся по handle")
+		}
+
+		sc := msg.ServerContent
+		if sc == nil {
+			continue
+		}
+
+		if sc.ModelTurn != nil {
+			for _, p := range sc.ModelTurn.Parts {
+				if p.InlineData != nil && len(p.InlineData.Data) > 0 {
+					if err := b.writeBinary(p.InlineData.Data); err != nil {
+						return
+					}
+				}
 			}
 		}
-		if page.NextPageToken == "" {
-			break
+		if t := sc.OutputTranscription; t != nil && t.Text != "" {
+			log.Printf("Тамада: %s", t.Text)
+			_ = b.writeJSON(fiber.Map{"type": "transcript", "role": "tamada", "text": t.Text})
 		}
-		page, err = page.Next(ctx)
-		if err != nil {
-			log.Printf("Ошибка при загрузке следующей страницы моделей: %v\n", err)
-			break
+		if t := sc.InputTranscription; t != nil && t.Text != "" {
+			_ = b.writeJSON(fiber.Map{"type": "transcript", "role": "user", "text": t.Text})
+		}
+		if sc.Interrupted {
+			_ = b.writeJSON(fiber.Map{"type": "interrupted"})
+		}
+		if sc.TurnComplete {
+			_ = b.writeJSON(fiber.Map{"type": "turn_complete"})
 		}
 	}
 }
 
 func main() {
-
-	ctx := context.Background()
-
 	_ = godotenv.Load()
 
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
-		log.Fatal("GEMINI_API_KEY не установлен!")
+		log.Fatal("GEMINI_API_KEY не установлен")
 	}
+	// Проверь актуальное имя в официальной документации Live API.
+	liveModel := getEnv("LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
+	port := getEnv("PORT", "8080")
+	appToken := os.Getenv("APP_TOKEN") // если задан — клиент обязан передать ?token=...
 
-	textModel := getEnv("TEXT_MODEL", "gemini-3.8-flash")
-	ttsModel := getEnv("TTS_MODEL", "gemini-3.8-flash-tts")
+	log.Printf("Live-модель: %s", liveModel)
 
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
+	client, err := genai.NewClient(context.Background(), &genai.ClientConfig{
 		APIKey:  apiKey,
 		Backend: genai.BackendGeminiAPI,
 	})
 	if err != nil {
-		log.Fatalf("Ошибка создания клиента Gemini: %v", err)
-	}
-
-	if os.Getenv("LIST_MODELS") == "1" {
-		listModels(ctx, client)
+		log.Fatalf("Ошибка создания клиента gemini: %v", err)
 	}
 
 	app := fiber.New()
 	app.Use(logger.New())
 	app.Use(cors.New())
 
-	app.Get("/", func(c *fiber.Ctx) error {
-		return c.SendString("ИИ-Тамада бэкенд на Go Fiber запущен! 🎤")
+	app.Use("/ws", func(c *fiber.Ctx) error {
+		if !websocket.IsWebSocketUpgrade(c) {
+			return fiber.ErrUpgradeRequired
+		}
+		if appToken != "" &&
+			subtle.ConstantTimeCompare([]byte(c.Query("token")), []byte(appToken)) != 1 {
+			return fiber.ErrUnauthorized
+		}
+		return c.Next()
 	})
 
-	app.Post("/api/tamada", func(c *fiber.Ctx) error {
-		type RequestBody struct {
-			Message string `json:"message"`
-		}
+	app.Get("/ws", websocket.New(func(c *websocket.Conn) {
+		log.Println("WS: клиент подключен")
+		defer log.Println("WS: клиент отключился")
 
-		var body RequestBody
-		if err := c.BodyParser(&body); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "Неверный формат JSON"})
-		}
-		if body.Message == "" {
-			body.Message = "Привет! Объяви тост!"
-		}
+		c.SetReadLimit(maxFrameBytes)
 
-		textResp, err := client.Models.GenerateContent(ctx, textModel, genai.Text(body.Message),
-			&genai.GenerateContentConfig{
-				SystemInstruction: genai.NewContentFromText(systemInstruction, "system"),
-			})
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": fmt.Sprintf("Ошибка текстовой модели: %v", err)})
-		}
-		speech := textResp.Text()
-		if speech == "" {
-			return c.Status(500).JSON(fiber.Map{"error": "Текстовая модель вернула пустой ответ"})
-		}
-		log.Printf("Текст тамады: %s", speech)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-		ttsConfig := &genai.GenerateContentConfig{
-			ResponseModalities: []string{"AUDIO"},
-			SpeechConfig: &genai.SpeechConfig{
-				VoiceConfig: &genai.VoiceConfig{
-					PrebuiltVoiceConfig: &genai.PrebuiltVoiceConfig{
-						VoiceName: "Fenrir", // мужской динамичный голос
-					},
-				},
-			},
-		}
-		resp, err := client.Models.GenerateContent(ctx, ttsModel,
-			genai.Text("Скажи громко, энергично и весело, как тамада на свадьбе: "+speech), ttsConfig)
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": fmt.Sprintf("Ошибка TTS: %v", err)})
-		}
+		b := &bridge{client: client, model: liveModel, conn: c}
+		defer b.close()
 
-		var audioBytes []byte
-	search:
-		for _, cand := range resp.Candidates {
-			if cand.Content == nil {
+		if err := b.open(ctx); err != nil {
+			log.Printf("Live: не удалось подключиться: %v", err)
+			_ = b.writeJSON(fiber.Map{"type": "error", "message": "Не удалось подключиться к Тамаде"})
+			return
+		}
+		log.Println("Live: сессия открыта")
+		_ = b.writeJSON(fiber.Map{"type": "status", "state": "live"})
+
+		go func() {
+			b.receiveLoop(ctx)
+			// Либо клиент ушёл, либо сессию не вернуть — закрываем WS, чтобы ReadMessage вышел.
+			_ = c.Close()
+		}()
+
+		for {
+			mt, data, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+
+			var sendErr error
+			switch mt {
+			case websocket.BinaryMessage:
+				sendErr = b.send(genai.LiveRealtimeInput{
+					Audio: &genai.Blob{Data: data, MIMEType: "audio/pcm;rate=16000"},
+				})
+			case websocket.TextMessage:
+				var in struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				}
+				if json.Unmarshal(data, &in) != nil {
+					continue
+				}
+				text := strings.TrimSpace(in.Text)
+				if !strings.EqualFold(in.Type, "text") || text == "" {
+					continue
+				}
+				sendErr = b.send(genai.LiveRealtimeInput{Text: text})
+			default:
 				continue
 			}
-			for _, part := range cand.Content.Parts {
-				if part.InlineData != nil && len(part.InlineData.Data) > 0 {
-					audioBytes = part.InlineData.Data
-					break search
-				}
+
+			// Ошибка отправки не должна ронять сервер: кадр теряем,
+			// а receiveLoop сам переподключит сессию.
+			if sendErr != nil && !errors.Is(sendErr, errNoSession) {
+				log.Printf("Live: не удалось отправить: %v", sendErr)
 			}
 		}
+	}))
 
-		if len(audioBytes) == 0 {
-			return c.Status(500).JSON(fiber.Map{"error": "Модель не вернула аудио"})
-		}
-
-		c.Set("Content-Type", "audio/wav")
-		return c.Send(pcmToWav(audioBytes, 24000, 1, 16))
+	app.Get("/", func(c *fiber.Ctx) error {
+		return c.SendString("Тамада запущен")
 	})
 
-	fmt.Println("Сервер запущен на http://localhost:8080")
-	log.Fatal(app.Listen(":8080"))
+	log.Fatal(app.Listen(":" + port))
 }

@@ -16,7 +16,6 @@ export default function Audio() {
   const [audioUrl, setAudioUrl] = useState("");
   const audioRef = useRef(null);
 
-  // чистим blob-URL, когда он больше не нужен
   useEffect(() => {
     return () => {
       if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -37,7 +36,6 @@ export default function Audio() {
         body: JSON.stringify({ message: msg }),
       });
 
-      // при ошибке бэк шлёт JSON, при успехе — WAV
       if (!res.ok) {
         const data = await res.json().catch(() => null);
         throw new Error(data?.error || `Ошибка сервера (${res.status})`);
@@ -47,7 +45,6 @@ export default function Audio() {
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
 
-      // ждём, пока React подставит src, и запускаем
       setTimeout(() => {
         audioRef.current?.play().catch(() => {
           setError("Браузер не дал включить звук. Нажми play на плеере.");
@@ -66,16 +63,7 @@ export default function Audio() {
 
   return (
     <main className="page">
-      <h1>Тамада-3000</h1>
       <p className="lead">Напиши, что нужно, и тамада ответит голосом.</p>
-
-      <div className="quick">
-        {QUICK.map((q) => (
-          <button key={q} type="button" onClick={() => ask(q)} disabled={loading}>
-            {q}
-          </button>
-        ))}
-      </div>
 
       <div className="row">
         <input
