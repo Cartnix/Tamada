@@ -19,15 +19,60 @@ import (
 	"google.golang.org/genai"
 )
 
-const systemInstruction = `Ты веселый, харизматичный и немного дерзкий ИИ-тамада на казахско-русской свадьбе по имени Тамада-3000.
+const systemInstruction = `Ты веселый, харизматичный и немного дерзкий ИИ-тамада на казахско-русской свадьбе по имени Броди.
 Твоя задача развлекать гостя, задавать смешные вопросы, на ходу придумывать тосты, шутить про родственников, жениха и невесту.
-Говори на смеси русского и казахского (с колоритом: "базар жок", "туган жер", "уважаемый", "красавчик"). Тон энергичный и громкий.
+Говори на русском языке. Тон энергичный и громкий.
 Отвечай коротко, не больше 5-6 предложений. Это живой разговор по голосу, поэтому без списков и markdown.`
 
 const (
 	maxReconnects = 4
 	maxFrameBytes = 64 * 1024 // защита от гигантских сообщений от клиента
+
+	clientTextType       clientMessageType = "Text"
+	transcriptType       serverMessageType = "transcript"
+	statusType           serverMessageType = "status"
+	interruptedType      serverMessageType = "interrupted"
+	turnCompleteType     serverMessageType = "turn_complete"
+	errorType            serverMessageType = "error"
+	userTranscriptRole   transcriptRole    = "user"
+	tamadaTranscriptRole transcriptRole    = "tamada"
+	statusLive           connectionState   = "live"
+	statusReconnecting   connectionState   = "reconnecting"
 )
+
+type clientMessageType string
+type serverMessageType string
+type transcriptRole string
+type connectionState string
+
+type clientTextMessage struct {
+	Type clientMessageType `json:"type"`
+	Text string            `json:"text"`
+}
+
+type transcriptMessage struct {
+	Type serverMessageType `json:"type"`
+	Role transcriptRole    `json:"role"`
+	Text string            `json:"text"`
+}
+
+type statusMessage struct {
+	Type  serverMessageType `json:"type"`
+	State connectionState   `json:"state"`
+}
+
+type interruptedMessage struct {
+	Type serverMessageType `json:"type"`
+}
+
+type turnCompleteMessage struct {
+	Type serverMessageType `json:"type"`
+}
+
+type errorMessage struct {
+	Type    serverMessageType `json:"type"`
+	Message string            `json:"message"`
+}
 
 var errNoSession = errors.New("live-сессия ещё не готова")
 
@@ -158,12 +203,12 @@ func (b *bridge) receiveLoop(ctx context.Context) {
 				return
 			}
 			log.Printf("Live: приём прервался: %v", err)
-			_ = b.writeJSON(fiber.Map{"type": "status", "state": "reconnecting"})
+			_ = b.writeJSON(statusMessage{Type: statusType, State: statusReconnecting})
 			if !b.reconnect(ctx) {
-				_ = b.writeJSON(fiber.Map{"type": "error", "message": "Связь с Тамадой потеряна"})
+				_ = b.writeJSON(errorMessage{Type: errorType, Message: "Связь с Тамадой потеряна"})
 				return
 			}
-			_ = b.writeJSON(fiber.Map{"type": "status", "state": "live"})
+			_ = b.writeJSON(statusMessage{Type: statusType, State: statusLive})
 			continue
 		}
 
@@ -192,16 +237,16 @@ func (b *bridge) receiveLoop(ctx context.Context) {
 		}
 		if t := sc.OutputTranscription; t != nil && t.Text != "" {
 			log.Printf("Тамада: %s", t.Text)
-			_ = b.writeJSON(fiber.Map{"type": "transcript", "role": "tamada", "text": t.Text})
+			_ = b.writeJSON(transcriptMessage{Type: transcriptType, Role: tamadaTranscriptRole, Text: t.Text})
 		}
 		if t := sc.InputTranscription; t != nil && t.Text != "" {
-			_ = b.writeJSON(fiber.Map{"type": "transcript", "role": "user", "text": t.Text})
+			_ = b.writeJSON(transcriptMessage{Type: transcriptType, Role: userTranscriptRole, Text: t.Text})
 		}
 		if sc.Interrupted {
-			_ = b.writeJSON(fiber.Map{"type": "interrupted"})
+			_ = b.writeJSON(interruptedMessage{Type: interruptedType})
 		}
 		if sc.TurnComplete {
-			_ = b.writeJSON(fiber.Map{"type": "turn_complete"})
+			_ = b.writeJSON(turnCompleteMessage{Type: turnCompleteType})
 		}
 	}
 }
@@ -214,7 +259,7 @@ func main() {
 		log.Fatal("GEMINI_API_KEY не установлен")
 	}
 	// Проверь актуальное имя в официальной документации Live API.
-	liveModel := getEnv("LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
+	liveModel := getEnv("LIVE_MODEL", "models/gemini-3.8-live")
 	port := getEnv("PORT", "8080")
 	appToken := os.Getenv("APP_TOKEN") // если задан — клиент обязан передать ?token=...
 
@@ -257,11 +302,11 @@ func main() {
 
 		if err := b.open(ctx); err != nil {
 			log.Printf("Live: не удалось подключиться: %v", err)
-			_ = b.writeJSON(fiber.Map{"type": "error", "message": "Не удалось подключиться к Тамаде"})
+			_ = b.writeJSON(errorMessage{Type: errorType, Message: "Не удалось подключиться к Тамаде"})
 			return
 		}
 		log.Println("Live: сессия открыта")
-		_ = b.writeJSON(fiber.Map{"type": "status", "state": "live"})
+		_ = b.writeJSON(statusMessage{Type: statusType, State: statusLive})
 
 		go func() {
 			b.receiveLoop(ctx)
@@ -282,15 +327,12 @@ func main() {
 					Audio: &genai.Blob{Data: data, MIMEType: "audio/pcm;rate=16000"},
 				})
 			case websocket.TextMessage:
-				var in struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				}
+				var in clientTextMessage
 				if json.Unmarshal(data, &in) != nil {
 					continue
 				}
 				text := strings.TrimSpace(in.Text)
-				if !strings.EqualFold(in.Type, "text") || text == "" {
+				if !strings.EqualFold(string(in.Type), string(clientTextType)) || text == "" {
 					continue
 				}
 				sendErr = b.send(genai.LiveRealtimeInput{Text: text})

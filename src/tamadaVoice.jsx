@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createClientTextMessage, parseServerMessage } from "./protocol";
 
 /**
  * <TamadaVoice />
@@ -75,6 +76,8 @@ export default function TamadaVoice({
   wsUrl,
   token,
   greeting = "Поприветствуй гостей и представься",
+  onSpeakingChange,
+  onUserMessage,
 }) {
   const [status, setStatus] = useState("idle"); // idle | connecting | live | reconnecting
   const [speaking, setSpeaking] = useState(false);
@@ -239,15 +242,14 @@ export default function TamadaVoice({
           playPcm(e.data);
           return;
         }
-        let msg;
-        try {
-          msg = JSON.parse(e.data);
-        } catch {
-          return;
-        }
+        const msg = parseServerMessage(e.data);
+        if (!msg) return;
         switch (msg.type) {
           case "transcript":
             addTranscript(msg.role, msg.text);
+            if (msg.role === "user" && typeof msg.text === "string") {
+              onUserMessage?.(msg.text);
+            }
             break;
           case "interrupted":
             stopPlayback();
@@ -284,19 +286,27 @@ export default function TamadaVoice({
       );
       stop();
     }
-  }, [wsUrl, token, greeting, playPcm, stopPlayback, addTranscript, stop]);
+  }, [wsUrl, token, greeting, onUserMessage, playPcm, stopPlayback, addTranscript, stop]);
 
   const sendText = useCallback(() => {
     const text = draft.trim();
     const ws = wsRef.current;
     if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "Text", text }));
+    ws.send(JSON.stringify(createClientTextMessage(text)));
     newBubbleRef.current = true;
     setMessages((prev) => [...prev, { id: ++idRef.current, role: "user", text }]);
+    onUserMessage?.(text);
     setDraft("");
-  }, [draft]);
+  }, [draft, onUserMessage]);
 
   useEffect(() => () => stop(), [stop]);
+
+    // Отправляем состояние speaking наружу
+  useEffect(() => {
+    if (onSpeakingChange) {
+      onSpeakingChange(speaking);
+    }
+  }, [speaking, onSpeakingChange]);
 
   useEffect(() => {
     const el = listRef.current;

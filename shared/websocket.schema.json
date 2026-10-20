@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WebSocketMessage",
+  "description": "JSON text frames exchanged between the React client and Go backend. Audio frames are binary PCM and are not covered here.",
+  "oneOf": [
+    { "$ref": "#/definitions/ClientTextMessage" },
+    { "$ref": "#/definitions/TranscriptMessage" },
+    { "$ref": "#/definitions/StatusMessage" },
+    { "$ref": "#/definitions/InterruptedMessage" },
+    { "$ref": "#/definitions/TurnCompleteMessage" },
+    { "$ref": "#/definitions/ErrorMessage" }
+  ],
+  "definitions": {
+    "ClientTextMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "text"],
+      "properties": {
+        "type": { "const": "Text" },
+        "text": { "type": "string", "minLength": 1 }
+      }
+    },
+    "TranscriptMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "role", "text"],
+      "properties": {
+        "type": { "const": "transcript" },
+        "role": { "enum": ["user", "tamada"] },
+        "text": { "type": "string", "minLength": 1 }
+      }
+    },
+    "StatusMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "state"],
+      "properties": {
+        "type": { "const": "status" },
+        "state": { "enum": ["live", "reconnecting"] }
+      }
+    },
+    "InterruptedMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "interrupted" }
+      }
+    },
+    "TurnCompleteMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "turn_complete" }
+      }
+    },
+    "ErrorMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "message"],
+      "properties": {
+        "type": { "const": "error" },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

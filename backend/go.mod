@@ -2,11 +2,14 @@ module backend
 
 go 1.24
 
-require google.golang.org/genai v1.75.0
+require (
+	github.com/gofiber/contrib/websocket v1.3.4
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
+	google.golang.org/genai v1.75.0
+)
 
 require (
 	github.com/fasthttp/websocket v1.5.8 // indirect
-	github.com/gofiber/contrib/websocket v1.3.4 // indirect
 	github.com/savsgio/gotils v0.0.0-20240303185622-093b76447511 // indirect
 )
 

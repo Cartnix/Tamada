@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "generate:protocol": "json2ts -i shared/websocket.schema.json -o src/protocol.generated.ts --unreachableDefinitions",
+    "check:protocol": "npm run generate:protocol && git diff --exit-code -- src/protocol.generated.ts",
+    "typecheck": "tsc --project tsconfig.json"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",
@@ -22,7 +25,9 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
+    "json-schema-to-typescript": "^16.0.0",
     "oxlint": "^1.81.0",
+    "typescript": "^7.0.2",
     "vite": "^8.3.0"
   }
 }
